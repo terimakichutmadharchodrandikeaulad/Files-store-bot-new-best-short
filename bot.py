@@ -1228,9 +1228,7 @@ async def inline_search(client, inline_query):
 # Note: welcome_and_goodbye_messages (on_chat_member_updated) is removed as it was not explicitly requested
 # The anti-link and anti-badword logic is moved to a general message handler for groups.
 
-@app.on_message(filters.group & ~filters.edited & ~filters.service)
-async def group_message_moderation(client: Client, message: Message):
-    """Applies anti-link and anti-badword filtering in groups."""
+
     
     if message.from_user.is_bot or message.from_user.id in ADMINS:
          return # Ignore messages from bots or admins
