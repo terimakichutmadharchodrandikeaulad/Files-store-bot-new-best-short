@@ -117,9 +117,9 @@ async def is_user_member_all_channels(client: Client, user_id: int, channels: li
     for channel in channels:
         try:
             # Check if the chat exists before checking membership
-            chat = await client.get_chat(chat_id=f"@{channel}")
+            chat = await client.get_chat(chat_id=f"https://{channel}")
             if chat.username and chat.username.lower() == channel.lower():
-                 member = await client.get_chat_member(chat_id=f"@{channel}", user_id=user_id)
+                 member = await client.get_chat_member(chat_id=f"https://{channel}", user_id=user_id)
                  if member.status in ["kicked", "left"]:
                      missing_channels.append(channel)
         except UserNotParticipant:
@@ -127,7 +127,7 @@ async def is_user_member_all_channels(client: Client, user_id: int, channels: li
         except Exception as e:
             # Only log severe errors, not common ones like chat not found
             if "CHAT_NOT_FOUND" not in str(e):
-                 logging.error(f"Error checking membership for {user_id} in @{channel}: {e}")
+                 logging.error(f"Error checking membership for {user_id} in https://{channel}: {e}")
             missing_channels.append(channel)
     return list(set(missing_channels)) # Return unique missing channels
 
