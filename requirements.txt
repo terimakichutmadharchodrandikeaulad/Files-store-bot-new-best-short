@@ -1,5 +1,4 @@
 pyrogram
 tgcrypto
-pymongo[srv]
 python-dotenv
 flask
