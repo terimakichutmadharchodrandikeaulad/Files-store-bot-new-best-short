@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+database.json
+database.json.tmp
+.env
