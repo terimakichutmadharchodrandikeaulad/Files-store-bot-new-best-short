@@ -1075,9 +1075,84 @@ async def broadcast_handler_reply_enhanced(client: Client, message: Message):
 
 # --- Callback Query Handlers ---
 
+def get_start_content(user):
+    first_name = user.first_name if user and user.first_name else "User"
+    buttons = [
+        [InlineKeyboardButton(to_small_caps("📚 About This Bot"), callback_data="about"),
+         InlineKeyboardButton(to_small_caps("💡 How to Use?"), callback_data="help")],
+        [InlineKeyboardButton(to_small_caps("⚙️ My Files & Settings"), callback_data="my_files_menu")]
+    ]
+    caption_text = to_small_caps(
+        f"Hello, {first_name}! I'm FileLinker Bot! 🤖\n\n"
+        "I convert your files into permanent, shareable links. "
+        "Just send me a file or start a bundle with /multi_link ! ✨"
+    )
+    return caption_text, InlineKeyboardMarkup(buttons)
+
+async def get_my_files_content(user_id, bot_username):
+    user_single_files = list(db.files.find({"user_id": user_id}).sort("created_at", -1).limit(5))
+    user_multi_files = list(db.multi_files.find({"user_id": user_id}).sort("created_at", -1).limit(5))
+
+    if not user_single_files and not user_multi_files:
+        return to_small_caps("😔 You haven't uploaded any files or created any bundles yet. Start with sending a file or /multi_link .")
+
+    text = to_small_caps("📂 Your Recent Uploads & Bundles:\n\n")
+
+    if user_single_files:
+        text += to_small_caps("--- Single Files (Last 5) ---\n")
+        for i, file_record in enumerate(user_single_files):
+            file_name = file_record.get('file_name', 'Unnamed File')
+            file_id_str = file_record['_id']
+            share_link = f"https://t.me/{bot_username}?start={file_id_str}"
+            text += f"**{i+1}.** `🔗` [{file_name}]({share_link})\n"
+        text += "\n"
+
+    if user_multi_files:
+        text += to_small_caps("--- Multi-File Bundles (Last 5) ---\n")
+        for i, bundle_record in enumerate(user_multi_files):
+            file_name = bundle_record.get('file_name', f"Bundle of {len(bundle_record.get('message_ids', []))} Files")
+            file_id_str = bundle_record['_id']
+            share_link = f"https://t.me/{bot_username}?start={file_id_str}"
+            text += f"**{i+1}.** `📦` [{file_name}]({share_link})\n"
+        text += "\n"
+
+    text += to_small_caps("To delete a file, use: /delete <file_id>")
+    return text
+
+def get_stats_content():
+    user_count = db.users.count_documents({})
+    single_files_count = db.files.count_documents({})
+    multi_files_count = db.multi_files.count_documents({})
+    total_files_count = single_files_count + multi_files_count
+
+    today_start_dt = datetime.now(timezone.utc) - timedelta(days=1)
+
+    today_new_users = db.users.count_documents({"last_activity": {"$gte": today_start_dt}})
+    today_single_files = db.files.count_documents({"created_at": {"$gte": today_start_dt}})
+    today_multi_files = db.multi_files.count_documents({"created_at": {"$gte": today_start_dt}})
+
+    file_types_cursor = db.files.aggregate([{"$group": {"_id": "$file_type", "count": {"$sum": 1}}}])
+    file_types_text = "\n".join([f"  • {ft['_id'].capitalize()}: **{ft['count']}**" for ft in file_types_cursor if ft['_id']])
+    if not file_types_text:
+        file_types_text = "  • No files recorded."
+
+    return to_small_caps(
+        f"📊 BOT STATISTICS\n\n"
+        f"--- User & Usage ---\n"
+        f"👥 Total Users: `{user_count}`\n"
+        f"🗓️ Active (Last 24h): `{today_new_users}`\n\n"
+        f"--- Files ---\n"
+        f"📁 Total Items: `{total_files_count}`\n"
+        f"📄 Single Files: `{single_files_count}`\n"
+        f"📦 Multi-Bundles: `{multi_files_count}`\n"
+        f"📈 Uploads (Last 24h): `{today_single_files + today_multi_files}`\n\n"
+        f"--- File Breakdown ---\n"
+    ) + file_types_text
+
 @app.on_callback_query(filters.regex("^(about|help|start_menu|my_files_menu|admin_stats|admin_settings|admin_broadcast_prompt|admin|view_my_files|view_force_channels)$"))
 async def general_callback_handler(client: Client, callback_query: CallbackQuery):
     query = callback_query.data
+    user = callback_query.from_user
     
     if query == "about":
         text = to_small_caps(
@@ -1090,25 +1165,60 @@ async def general_callback_handler(client: Client, callback_query: CallbackQuery
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(to_small_caps("💡 How to Use?"), callback_data="help"), InlineKeyboardButton(to_small_caps("🔙 Back to Start"), callback_data="start_menu")]])
         
     elif query == "help":
-         await help_handler_private(client, callback_query.message)
-         await callback_query.answer()
-         return
-         
+        text = to_small_caps(
+            "💡 FileLinker Bot Usage Guide\n\n"
+            "1. Single File Link:\n"
+            "   - Send me any file (document, video, photo, audio).\n"
+            "   - Custom Force Join: Use /create_link @channel_username [Title] then send the file.\n\n"
+            "2. Multi-File Bundle Link:\n"
+            "   - Start the bundle: /multi_link [Title for bundle]\n"
+            "   - Forward all your files to me.\n"
+            "   - Finish: Send /done .\n"
+            "   - Custom Force Join: Use /multi_link @channel_username [Title]\n\n"
+            "3. Set Thumbnail:\n"
+            "   - Reply to a photo with: /set_thumbnail\n"
+            "   - The next file or bundle will use that photo as its thumbnail.\n\n"
+            "4. Management:\n"
+            "   - My Files: /myfiles (View your last 10 uploads).\n"
+            "   - Delete: /delete <file_id> (Permanently delete your file/bundle).\n\n"
+            "5. Inline Search (Everywhere):\n"
+            "   - In any chat, type: @bot_username <file_name> to search and share links instantly!"
+        )
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(to_small_caps("🔙 Back to Start"), callback_data="start_menu")]])
+
     elif query == "start_menu":
-         await start_handler(client, callback_query.message)
-         await callback_query.answer()
-         return
-         
+        if user:
+            user_name = await get_user_full_name(user)
+            db.users.update_one(
+                {"_id": user.id},
+                {"$set": {"name": user_name, "last_activity": datetime.now(timezone.utc)}},
+                upsert=True
+            )
+        text, keyboard = get_start_content(user)
+
     elif query == "admin":
-         await admin_panel_handler(client, callback_query.message)
-         await callback_query.answer()
-         return
-         
+        if not user or user.id not in ADMINS:
+            await callback_query.answer(to_small_caps("❌ Permission Denied! Only Admins can access this."), show_alert=True)
+            return
+        current_mode = await get_bot_mode(db)
+        buttons = [
+            [InlineKeyboardButton(to_small_caps("📊 Bot Stats"), callback_data="admin_stats"),
+             InlineKeyboardButton(to_small_caps(f"⚙️ Mode: {current_mode.upper()}"), callback_data="admin_settings")],
+            [InlineKeyboardButton(to_small_caps("📣 Broadcast Message"), callback_data="admin_broadcast_prompt")]
+        ]
+        text = to_small_caps(
+            "👑 Admin Panel Access Granted! 🛡️\n\n"
+            "Welcome back! Manage your bot's operation and check statistics below."
+        )
+        keyboard = InlineKeyboardMarkup(buttons)
+
     elif query == "admin_stats":
-         await stats_handler(client, callback_query.message)
-         await callback_query.answer()
-         return
-         
+        if not user or user.id not in ADMINS:
+            await callback_query.answer(to_small_caps("❌ Permission Denied! Only Admins can access this."), show_alert=True)
+            return
+        text = get_stats_content()
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(to_small_caps("🔙 Back to Admin"), callback_data="admin")]])
+
     elif query == "my_files_menu":
         buttons = [
             [InlineKeyboardButton(to_small_caps("📂 View My Last 10 Files"), callback_data="view_my_files")],
@@ -1117,28 +1227,29 @@ async def general_callback_handler(client: Client, callback_query: CallbackQuery
         ]
         text = to_small_caps("⚙️ My Dashboard\n\nManage your uploaded files and check the current force join channels.")
         keyboard = InlineKeyboardMarkup(buttons)
-        
+
     elif query == "view_my_files":
-         await my_files_handler(client, callback_query.message)
-         await callback_query.answer()
-         return
-         
+        user_id = user.id if user else 0
+        bot_username = (await client.get_me()).username
+        text = await get_my_files_content(user_id, bot_username)
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(to_small_caps("🔙 Back to Menu"), callback_data="my_files_menu")]])
+
     elif query == "view_force_channels":
         if FORCE_CHANNELS:
             channels_text = "\n".join([f"• @{ch}" for ch in FORCE_CHANNELS])
             text = to_small_caps(f"🌐 Global Force Join Channels\n\n{channels_text}\n\nYou must join these to use certain features.")
         else:
             text = to_small_caps("❌ Global Force Join is NOT active! No channels are required for general use.")
-            
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(to_small_caps("🔙 Back to Menu"), callback_data="my_files_menu")]])
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(to_small_caps("🔙 Back to Menu"), callback_data="my_files_menu")]])
 
     elif query == "admin_settings":
+        if not user or user.id not in ADMINS:
+            await callback_query.answer(to_small_caps("❌ Permission Denied! Only Admins can access this."), show_alert=True)
+            return
         current_mode = await get_bot_mode(db)
-        
         public_button = InlineKeyboardButton(to_small_caps("🌍 Public (Anyone)"), callback_data="set_mode_public")
         private_button = InlineKeyboardButton(to_small_caps("🔒 Private (Admins Only)"), callback_data="set_mode_private")
         keyboard = InlineKeyboardMarkup([[public_button], [private_button], [InlineKeyboardButton(to_small_caps("🔙 Back to Admin"), callback_data="admin")]])
-        
         text = to_small_caps(
             f"⚙️ Bot File Upload Mode\n\n"
             f"The current mode is {current_mode.upper()}.\n"
@@ -1146,6 +1257,9 @@ async def general_callback_handler(client: Client, callback_query: CallbackQuery
         )
 
     elif query == "admin_broadcast_prompt":
+        if not user or user.id not in ADMINS:
+            await callback_query.answer(to_small_caps("❌ Permission Denied! Only Admins can access this."), show_alert=True)
+            return
         text = to_small_caps(
             "📣 Broadcast Message\n\n"
             "Please reply to the message/media you want to broadcast and use /broadcast .\n"
@@ -1159,9 +1273,12 @@ async def general_callback_handler(client: Client, callback_query: CallbackQuery
         else:
             await callback_query.message.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
     except Exception:
-         await callback_query.message.delete()
-         await callback_query.message.reply(text, reply_markup=keyboard, disable_web_page_preview=True)
-        
+        try:
+            await callback_query.message.delete()
+        except Exception:
+            pass
+        await callback_query.message.reply(text, reply_markup=keyboard, disable_web_page_preview=True)
+
     await callback_query.answer()
     
 @app.on_callback_query(filters.regex(r"^check_join_"))
