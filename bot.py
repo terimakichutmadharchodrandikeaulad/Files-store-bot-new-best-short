@@ -97,8 +97,12 @@ class JsonCollection:
                 for k, v in filter_dict.items():
                     if not k.startswith("$"):
                         new_doc[k] = v
+                if "$set" in update_dict:
+                    for k, v in update_dict["$set"].items():
+                        new_doc[k] = v
                 self._apply_update(new_doc, update_dict)
-                data.append(self._prepare_for_json(new_doc))
+                prepared_doc = self._prepare_for_json(new_doc)
+                data.append(prepared_doc)
                 self.db._save_unlocked()
                 class UpdateResult:
                     modified_count = 1
@@ -323,6 +327,24 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
+# --- Chat Join Request Handler ---
+
+@app.on_chat_join_request()
+async def join_request_handler(client: Client, chat_join_request):
+    user_id = chat_join_request.from_user.id
+    chat_id = chat_join_request.chat.id
+
+    db.join_requests.update_one(
+        {"user_id": user_id, "chat_id": chat_id},
+        {"$set": {
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "created_at": datetime.now(timezone.utc)
+        }},
+        upsert=True
+    )
+    logging.info(f"Recorded join request for user {user_id} in chat {chat_id}")
+
 # --- Helper Functions ---
 
 def generate_random_string(length=8):
@@ -347,25 +369,116 @@ async def get_user_full_name(user):
         return full_name.strip() if full_name else f"User_{user.id}"
     return "Unknown User"
 
-async def is_user_member_all_channels(client: Client, user_id: int, channels: list) -> list:
-    """Checks user membership in a list of channels and returns missing ones."""
-    missing_channels = []
-    if not channels:
-        return []
-    for channel in channels:
+async def get_required_channels_data(client: Client, extra_channels: list = None) -> list:
+    """
+    Collects channel info dicts for all required force join channels (from env, DB, and extra).
+    Each dict has: {'chat_id', 'title', 'username', 'invite_link', 'identifier'}
+    """
+    channel_list = []
+    seen_identifiers = set()
+
+    # 1. Dynamic force channels from database
+    db_fs_channels = list(db.force_channels.find({}))
+    for ch_doc in db_fs_channels:
+        ident = str(ch_doc.get("chat_id") or ch_doc.get("_id"))
+        if ident in seen_identifiers:
+            continue
+        seen_identifiers.add(ident)
+        channel_list.append({
+            "chat_id": ch_doc.get("chat_id"),
+            "title": ch_doc.get("title") or "Required Channel",
+            "username": ch_doc.get("username"),
+            "invite_link": ch_doc.get("invite_link"),
+            "identifier": ident
+        })
+
+    # 2. Environment variable FORCE_CHANNELS
+    for env_ch in FORCE_CHANNELS:
+        clean_ch = env_ch.strip().replace("@", "")
+        if clean_ch and clean_ch.lower() not in seen_identifiers:
+            seen_identifiers.add(clean_ch.lower())
+            channel_list.append({
+                "chat_id": f"@{clean_ch}",
+                "title": f"@{clean_ch}",
+                "username": clean_ch,
+                "invite_link": f"https://t.me/{clean_ch}",
+                "identifier": clean_ch.lower()
+            })
+
+    # 3. Extra channels (e.g. per-file custom force_channel)
+    if extra_channels:
+        for extra in extra_channels:
+            if not extra:
+                continue
+            clean_extra = extra.strip().replace("@", "")
+            if clean_extra and clean_extra.lower() not in seen_identifiers:
+                seen_identifiers.add(clean_extra.lower())
+                channel_list.append({
+                    "chat_id": f"@{clean_extra}",
+                    "title": f"@{clean_extra}",
+                    "username": clean_extra,
+                    "invite_link": f"https://t.me/{clean_extra}",
+                    "identifier": clean_extra.lower()
+                })
+
+    return channel_list
+
+async def get_missing_channels_for_user(client: Client, user_id: int, channels_data: list) -> list:
+    """
+    Checks if user is member OR has requested to join for each channel.
+    Returns list of channel dicts where user has NOT joined or requested.
+    """
+    missing = []
+    for ch in channels_data:
+        target = ch.get("chat_id") or (f"@{ch['username']}" if ch.get("username") else None)
+        if not target:
+            continue
+
+        resolved_chat_id = None
+        is_satisfied = False
+
+        # Try to resolve chat object
         try:
-            chat = await client.get_chat(chat_id=f"@{channel}")
-            if chat.username and chat.username.lower() == channel.lower():
-                 member = await client.get_chat_member(chat_id=f"@{channel}", user_id=user_id)
-                 if member.status in ["kicked", "left"]:
-                     missing_channels.append(channel)
-        except UserNotParticipant:
-            missing_channels.append(channel)
+            chat_obj = await client.get_chat(target)
+            resolved_chat_id = chat_obj.id
+            if not ch.get("invite_link") and chat_obj.invite_link:
+                ch["invite_link"] = chat_obj.invite_link
+            if chat_obj.title and ch["title"].startswith("@"):
+                ch["title"] = chat_obj.title
         except Exception as e:
-            if "CHAT_NOT_FOUND" not in str(e):
-                 logging.error(f"Error checking membership for {user_id} in @{channel}: {e}")
-            missing_channels.append(channel)
-    return list(set(missing_channels))
+            logging.warning(f"Could not fetch chat object for {target}: {e}")
+
+        # Check membership using Pyrogram
+        try:
+            member = await client.get_chat_member(target, user_id)
+            if member.status in ["owner", "administrator", "member", "restricted"]:
+                is_satisfied = True
+        except UserNotParticipant:
+            pass
+        except Exception as e:
+            logging.error(f"Error checking chat member status for {user_id} in {target}: {e}")
+
+        # Check if user submitted a join request
+        if not is_satisfied:
+            filter_query = {"user_id": user_id}
+            if resolved_chat_id:
+                req = db.join_requests.find_one({"user_id": user_id, "chat_id": resolved_chat_id})
+            else:
+                req = db.join_requests.find_one({"user_id": user_id, "chat_id": target})
+
+            if req:
+                is_satisfied = True
+
+        if not is_satisfied:
+            missing.append(ch)
+
+    return missing
+
+async def is_user_member_all_channels(client: Client, user_id: int, channels: list) -> list:
+    """Legacy helper maintained for backward compatibility."""
+    channels_data = await get_required_channels_data(client, extra_channels=channels)
+    missing_data = await get_missing_channels_for_user(client, user_id, channels_data)
+    return [m.get("username") or str(m.get("chat_id")) for m in missing_data]
 
 async def get_bot_mode(db) -> str:
     """Fetches the current bot operation mode."""
@@ -376,10 +489,10 @@ async def get_bot_mode(db) -> str:
     return "public"
 
 def force_join_check(func):
-    """Decorator to check if a user is a member of all required channels."""
+    """Decorator to check if a user is a member of all required channels or requested to join."""
     async def wrapper(client, message):
         user_id = message.from_user.id
-        all_channels_to_check = list(FORCE_CHANNELS)
+        extra_channels = []
         file_id_str = None
 
         if isinstance(message, Message) and message.text:
@@ -395,20 +508,26 @@ def force_join_check(func):
             multi_file_record = db.multi_files.find_one({"_id": file_id_str})
             
             if file_record and file_record.get('force_channel'):
-                all_channels_to_check.append(file_record['force_channel'])
+                extra_channels.append(file_record['force_channel'])
             elif multi_file_record and multi_file_record.get('force_channel'):
-                all_channels_to_check.append(multi_file_record['force_channel'])
+                extra_channels.append(multi_file_record['force_channel'])
         
-        all_channels_to_check = list(set(all_channels_to_check))
-        missing_channels = await is_user_member_all_channels(client, user_id, all_channels_to_check)
+        channels_data = await get_required_channels_data(client, extra_channels=extra_channels)
+        missing_channels = await get_missing_channels_for_user(client, user_id, channels_data)
         
         if missing_channels:
-            join_buttons = [[InlineKeyboardButton(to_small_caps(f"🔗 Join @{ch}"), url=f"https://t.me/{ch}")] for ch in missing_channels]
+            join_buttons = []
+            for ch in missing_channels:
+                btn_text = to_small_caps(f"🔗 Join / Request {ch['title']}")
+                url = ch.get("invite_link") or (f"https://t.me/{ch['username']}" if ch.get("username") else None)
+                if url:
+                    join_buttons.append([InlineKeyboardButton(btn_text, url=url)])
+
             callback_data = f"check_join_{file_id_str}" if file_id_str else "check_join_force"
             join_buttons.append([InlineKeyboardButton(to_small_caps("🔄 Try Again"), callback_data=callback_data)])
             
             await message.reply(
-                to_small_caps("🛑 ACCESS DENIED 🛑\n\nTo access this file/feature, you must first join the following required channels:"),
+                to_small_caps("🛑 ACCESS DENIED 🛑\n\nTo access this file/feature, please join or request to join the required channels below:"),
                 reply_markup=InlineKeyboardMarkup(join_buttons),
                 quote=True
             )
@@ -1014,6 +1133,143 @@ async def stats_handler(client: Client, message: Message):
         ) + file_types_text
     )
 
+@app.on_message(filters.command(["setfs", "set_fs"]) & filters.private & filters.user(ADMINS))
+async def set_fs_handler(client: Client, message: Message):
+    if len(message.command) < 2 and not message.reply_to_message:
+        await message.reply(
+            to_small_caps(
+                "❌ Usage: /setfs <channel_id or @username or invite_link>\n"
+                "Or reply to a forwarded message from the channel with /setfs ."
+            )
+        )
+        return
+
+    target_chat = None
+    if message.reply_to_message and message.reply_to_message.forward_from_chat:
+        target_chat = message.reply_to_message.forward_from_chat.id
+    elif len(message.command) >= 2:
+        target_chat = message.command[1].strip()
+
+    if not target_chat:
+        await message.reply(to_small_caps("❌ Invalid channel specified."))
+        return
+
+    if isinstance(target_chat, str):
+        if target_chat.startswith("https://t.me/"):
+            target_chat = target_chat.replace("https://t.me/", "")
+            if not target_chat.startswith("+") and not target_chat.startswith("joinchat/") and "/" in target_chat:
+                target_chat = target_chat.split("/")[0]
+        if target_chat.startswith("@"):
+            target_chat = target_chat[1:]
+        if target_chat.lstrip("-").isdigit():
+            target_chat = int(target_chat)
+
+    try:
+        chat = await client.get_chat(target_chat)
+    except Exception as e:
+        await message.reply(to_small_caps(f"❌ Failed to get chat details: {e}\nMake sure the bot is an admin in the channel."))
+        return
+
+    bot_me = await client.get_me()
+    try:
+        bot_member = await client.get_chat_member(chat.id, bot_me.id)
+        if bot_member.status not in ["administrator", "owner"]:
+            await message.reply(to_small_caps("❌ I am not an admin in that channel. Please promote me to admin first."))
+            return
+    except Exception as e:
+        await message.reply(to_small_caps(f"❌ Could not check admin permissions in channel: {e}"))
+        return
+
+    invite_link = chat.invite_link
+    if not invite_link:
+        try:
+            invite_link = await client.export_chat_invite_link(chat.id)
+        except Exception:
+            try:
+                created_link = await client.create_chat_invite_link(chat.id, creates_join_request=True)
+                invite_link = created_link.invite_link
+            except Exception:
+                if chat.username:
+                    invite_link = f"https://t.me/{chat.username}"
+
+    db.force_channels.update_one(
+        {"_id": str(chat.id)},
+        {"$set": {
+            "chat_id": chat.id,
+            "title": chat.title,
+            "username": chat.username,
+            "invite_link": invite_link,
+            "created_at": datetime.now(timezone.utc)
+        }},
+        upsert=True
+    )
+
+    await message.reply(
+        to_small_caps(
+            f"✅ Force Sub Channel Set Successfully!\n\n"
+            f"• Title: {chat.title}\n"
+            f"• ID: `{chat.id}`\n"
+            f"• Username: @{chat.username if chat.username else 'N/A'}\n"
+            f"• Link: {invite_link or 'N/A'}"
+        ),
+        disable_web_page_preview=True
+    )
+
+@app.on_message(filters.command(["remfs", "del_fs", "delfs"]) & filters.private & filters.user(ADMINS))
+async def rem_fs_handler(client: Client, message: Message):
+    if len(message.command) < 2:
+        await message.reply(to_small_caps("❌ Usage: /remfs <channel_id or @username>"))
+        return
+
+    target = message.command[1].strip()
+    if target.startswith("@"):
+        target = target[1:]
+
+    channel_doc = None
+    if target.lstrip("-").isdigit():
+        channel_doc = db.force_channels.find_one({"_id": target}) or db.force_channels.find_one({"chat_id": int(target)})
+
+    if not channel_doc:
+        channel_doc = db.force_channels.find_one({"username": target})
+
+    if not channel_doc:
+        for doc in db.force_channels.find({}):
+            if str(doc.get("chat_id")) == target or str(doc.get("_id")) == target or (doc.get("username") and doc.get("username").lower() == target.lower()):
+                channel_doc = doc
+                break
+
+    if not channel_doc:
+        await message.reply(to_small_caps("❌ Force sub channel not found in database."))
+        return
+
+    db.force_channels.delete_one({"_id": channel_doc["_id"]})
+    await message.reply(to_small_caps(f"✅ Removed Force Sub Channel: {channel_doc.get('title', 'Channel')} (`{channel_doc.get('_id')}`)"))
+
+@app.on_message(filters.command(["getfs", "fs_channels", "listfs"]) & filters.private & filters.user(ADMINS))
+async def get_fs_handler(client: Client, message: Message):
+    fs_list = list(db.force_channels.find({}))
+
+    text = to_small_caps("📋 Force Sub Channels List:\n\n")
+
+    if fs_list:
+        text += to_small_caps("--- Dynamic Force Sub Channels ---\n")
+        for i, ch in enumerate(fs_list, 1):
+            title = ch.get("title", "Channel")
+            chat_id = ch.get("chat_id") or ch.get("_id")
+            username = f"@{ch.get('username')}" if ch.get("username") else "Private"
+            link = ch.get("invite_link", "No link")
+            text += f"**{i}.** [{title}]({link}) (`{chat_id}`) | {username}\n"
+        text += "\n"
+    else:
+        text += to_small_caps("No dynamic Force Sub channels configured via /setfs .\n\n")
+
+    if FORCE_CHANNELS:
+        text += to_small_caps("--- Environment FORCE_CHANNELS ---\n")
+        for ch in FORCE_CHANNELS:
+            text += f"• @{ch}\n"
+
+    await message.reply(text, disable_web_page_preview=True)
+
 @app.on_message(filters.command("broadcast") & filters.private & filters.user(ADMINS))
 async def broadcast_handler_reply_enhanced(client: Client, message: Message):
     if not message.reply_to_message and len(message.command) < 2:
@@ -1235,9 +1491,21 @@ async def general_callback_handler(client: Client, callback_query: CallbackQuery
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(to_small_caps("🔙 Back to Menu"), callback_data="my_files_menu")]])
 
     elif query == "view_force_channels":
-        if FORCE_CHANNELS:
-            channels_text = "\n".join([f"• @{ch}" for ch in FORCE_CHANNELS])
-            text = to_small_caps(f"🌐 Global Force Join Channels\n\n{channels_text}\n\nYou must join these to use certain features.")
+        db_fs_channels = list(db.force_channels.find({}))
+        if db_fs_channels or FORCE_CHANNELS:
+            channels_lines = []
+            for ch in db_fs_channels:
+                title = ch.get('title', 'Channel')
+                link = ch.get('invite_link') or (f"https://t.me/{ch['username']}" if ch.get('username') else "#")
+                channels_lines.append(f"• [{title}]({link})")
+            for env_ch in FORCE_CHANNELS:
+                clean_env_ch = env_ch.strip().replace('@', '')
+                if clean_env_ch and not any(d.get('username') and d['username'].lower() == clean_env_ch.lower() for d in db_fs_channels):
+                    channels_lines.append(f"• [@{clean_env_ch}](https://t.me/{clean_env_ch})")
+
+            channels_text = "\n".join(channels_lines)
+            text = to_small_caps(f"🌐 Global Force Join Channels\n\n{channels_text}\n\nYou must join or request to join these channels to use the bot.")
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(to_small_caps("🔙 Back to Menu"), callback_data="my_files_menu")]])
         else:
             text = to_small_caps("❌ Global Force Join is NOT active! No channels are required for general use.")
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(to_small_caps("🔙 Back to Menu"), callback_data="my_files_menu")]])
@@ -1287,22 +1555,21 @@ async def check_join_callback(client: Client, callback_query: CallbackQuery):
     parts = callback_query.data.split("_", 2)
     file_id_str = parts[2] if len(parts) > 2 else None
 
-    all_channels_to_check = list(FORCE_CHANNELS)
-    
+    extra_channels = []
     if file_id_str and file_id_str != 'force':
         file_record = db.files.find_one({"_id": file_id_str})
         multi_file_record = db.multi_files.find_one({"_id": file_id_str})
 
         if file_record and file_record.get('force_channel'):
-            all_channels_to_check.append(file_record['force_channel'])
+            extra_channels.append(file_record['force_channel'])
         elif multi_file_record and multi_file_record.get('force_channel'):
-            all_channels_to_check.append(multi_file_record['force_channel'])
+            extra_channels.append(multi_file_record['force_channel'])
     
-    all_channels_to_check = list(set(all_channels_to_check))
-    missing_channels = await is_user_member_all_channels(client, user_id, all_channels_to_check)
+    channels_data = await get_required_channels_data(client, extra_channels=extra_channels)
+    missing_channels = await get_missing_channels_for_user(client, user_id, channels_data)
 
     if not missing_channels:
-        await callback_query.answer(to_small_caps("Thanks for joining! Sending files now... 🥳"), show_alert=True)
+        await callback_query.answer(to_small_caps("Thanks for joining/requesting! Processing now... 🥳"), show_alert=True)
         try:
              await callback_query.message.delete()
         except Exception:
@@ -1314,16 +1581,22 @@ async def check_join_callback(client: Client, callback_query: CallbackQuery):
              fake_message.command = ["start", file_id_str]
              await start_handler(client, fake_message)
         else:
-             await callback_query.message.reply(to_small_caps("✅ You are a member of all required channels now! Please try the feature again."))
+             await callback_query.message.reply(to_small_caps("✅ You have joined or requested to join all required channels now! Please try the feature again."))
 
     else:
-        await callback_query.answer(to_small_caps("You have not joined all the channels. Please join them and try again."), show_alert=True)
-        join_buttons = [[InlineKeyboardButton(to_small_caps(f"🔗 Join @{ch}"), url=f"https://t.me/{ch}")] for ch in missing_channels]
-        join_buttons.append([InlineKeyboardButton(to_small_caps("✅ I Have Joined! (Try Again)"), callback_data=callback_query.data)])
+        await callback_query.answer(to_small_caps("You have not joined or requested all required channels yet."), show_alert=True)
+        join_buttons = []
+        for ch in missing_channels:
+            btn_text = to_small_caps(f"🔗 Join / Request {ch['title']}")
+            url = ch.get("invite_link") or (f"https://t.me/{ch['username']}" if ch.get("username") else None)
+            if url:
+                join_buttons.append([InlineKeyboardButton(btn_text, url=url)])
+
+        join_buttons.append([InlineKeyboardButton(to_small_caps("✅ I Have Joined / Requested! (Try Again)"), callback_data=callback_query.data)])
         keyboard = InlineKeyboardMarkup(join_buttons)
         
         await callback_query.message.edit_text(
-            to_small_caps("❌ ACCESS DENIED\n\nPlease join the remaining channels to continue:"),
+            to_small_caps("❌ ACCESS DENIED\n\nPlease join or send a join request to the remaining channels below:"),
             reply_markup=keyboard
         )
 

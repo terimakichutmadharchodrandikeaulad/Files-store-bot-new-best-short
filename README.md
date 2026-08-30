@@ -9,7 +9,7 @@ FileLinker Bot is a feature-rich Telegram bot built using **Python**, **Pyrogram
 - 📄 **Single File to Link**: Convert any uploaded file into a permanent shareable Telegram link.
 - 📦 **Multi-File Bundling**: Combine multiple files into a single shareable link.
 - 🖼️ **Custom Thumbnails**: Set custom thumbnails for single files or bundles.
-- 🔒 **Force Join Channels**: Enforce users to join specific channels before retrieving files.
+- 🔒 **Force Join & Join Request Support**: Enforce users to join specific channels or send a join request (for private/approval channels) before retrieving files. Dynamic `/setfs` management for admins.
 - 🔍 **Inline Search**: Search and share your uploaded files/bundles directly in any Telegram chat.
 - ⏱️ **Auto-Deletion**: Auto-deletes sent files after 60 minutes to protect storage and privacy.
 - 👑 **Admin Controls**: Stat tracking, public/private upload mode toggle, and message broadcasting.
@@ -42,6 +42,9 @@ FileLinker Bot is a feature-rich Telegram bot built using **Python**, **Pyrogram
 | `/admin` | Opens the Admin Panel dashboard to manage bot settings, stats, and broadcasts. |
 | `/stats` | Views detailed bot statistics including user counts, active users, total files, and breakdown by file types. |
 | `/broadcast` | Broadcasts a text message or replied media/message to all registered bot users. |
+| `/setfs <channel_id \| @username \| link>` | Adds a force sub channel dynamically. Works with public and private join-request channels. |
+| `/remfs <channel_id \| @username>` | Removes a force sub channel from dynamic configuration. |
+| `/getfs` | Lists all configured dynamic force sub channels and environment channels. |
 
 ---
 
