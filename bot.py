@@ -11,6 +11,7 @@ from threading import Lock, Thread
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
+from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired
 from pyrogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, Message,
@@ -451,7 +452,7 @@ async def get_missing_channels_for_user(client: Client, user_id: int, channels_d
         # Check membership using Pyrogram
         try:
             member = await client.get_chat_member(target, user_id)
-            if member.status in ["owner", "administrator", "member", "restricted"]:
+            if member.status in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED] or str(getattr(member.status, "value", member.status)) in ["owner", "administrator", "member", "restricted"]:
                 is_satisfied = True
         except UserNotParticipant:
             pass
@@ -687,7 +688,10 @@ async def create_link_handler(client: Client, message: Message):
             await message.reply(to_small_caps("❌ That is not a valid public channel username. Please provide a public channel username."))
             return
         
-        await client.get_chat_member(chat_id=f"@{force_channel}", user_id=(await client.get_me()).id)
+        bot_member = await client.get_chat_member(chat_id=f"@{force_channel}", user_id=(await client.get_me()).id)
+        if bot_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER] and str(getattr(bot_member.status, "value", bot_member.status)) not in ["administrator", "owner"]:
+            await message.reply(to_small_caps("❌ I am not an admin in that channel. Please promote me to admin first."))
+            return
         
         user_state = db.settings.find_one({"_id": message.from_user.id, "type": "temp_link"})
         thumbnail_id = user_state.get("thumbnail_id") if user_state else None
@@ -878,7 +882,10 @@ async def multi_link_handler(client: Client, message: Message):
             if chat.type != 'channel':
                 await message.reply(to_small_caps("❌ That is not a valid public channel username."))
                 return
-            await client.get_chat_member(chat_id=f"@{force_channel}", user_id=(await client.get_me()).id)
+            bot_member = await client.get_chat_member(chat_id=f"@{force_channel}", user_id=(await client.get_me()).id)
+            if bot_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER] and str(getattr(bot_member.status, "value", bot_member.status)) not in ["administrator", "owner"]:
+                await message.reply(to_small_caps("❌ I am not an admin in that channel. Please promote me to admin first."))
+                return
             
             db.settings.update_one(
                 {"_id": message.from_user.id, "type": "temp_link"},
@@ -1154,18 +1161,32 @@ async def set_fs_handler(client: Client, message: Message):
         await message.reply(to_small_caps("❌ Invalid channel specified."))
         return
 
+    invite_link_input = None
     if isinstance(target_chat, str):
+        target_chat = target_chat.strip()
         if target_chat.startswith("https://t.me/"):
-            target_chat = target_chat.replace("https://t.me/", "")
-            if not target_chat.startswith("+") and not target_chat.startswith("joinchat/") and "/" in target_chat:
-                target_chat = target_chat.split("/")[0]
-        if target_chat.startswith("@"):
-            target_chat = target_chat[1:]
-        if target_chat.lstrip("-").isdigit():
-            target_chat = int(target_chat)
+            clean_path = target_chat.replace("https://t.me/", "").strip()
+            if clean_path.startswith("+") or clean_path.startswith("joinchat/"):
+                invite_link_input = target_chat
+            elif clean_path.startswith("c/"):
+                # Channel message link format t.me/c/123456789/10
+                parts = clean_path.split("/")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    target_chat = int("-100" + parts[1])
+            else:
+                target_chat = clean_path.split("/")[0].split("?")[0]
+
+        if isinstance(target_chat, str):
+            if target_chat.startswith("@"):
+                target_chat = target_chat[1:]
+            if target_chat.lstrip("-").isdigit():
+                target_chat = int(target_chat)
 
     try:
-        chat = await client.get_chat(target_chat)
+        if invite_link_input and not isinstance(target_chat, int):
+            chat = await client.get_chat(invite_link_input)
+        else:
+            chat = await client.get_chat(target_chat)
     except Exception as e:
         await message.reply(to_small_caps(f"❌ Failed to get chat details: {e}\nMake sure the bot is an admin in the channel."))
         return
@@ -1173,14 +1194,14 @@ async def set_fs_handler(client: Client, message: Message):
     bot_me = await client.get_me()
     try:
         bot_member = await client.get_chat_member(chat.id, bot_me.id)
-        if bot_member.status not in ["administrator", "owner"]:
+        if bot_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER] and str(getattr(bot_member.status, "value", bot_member.status)) not in ["administrator", "owner"]:
             await message.reply(to_small_caps("❌ I am not an admin in that channel. Please promote me to admin first."))
             return
     except Exception as e:
         await message.reply(to_small_caps(f"❌ Could not check admin permissions in channel: {e}"))
         return
 
-    invite_link = chat.invite_link
+    invite_link = invite_link_input or chat.invite_link
     if not invite_link:
         try:
             invite_link = await client.export_chat_invite_link(chat.id)
@@ -1222,6 +1243,15 @@ async def rem_fs_handler(client: Client, message: Message):
         return
 
     target = message.command[1].strip()
+    if target.startswith("https://t.me/"):
+        target = target.replace("https://t.me/", "").strip().rstrip("/")
+        if target.startswith("c/"):
+            parts = target.split("/")
+            if len(parts) >= 2 and parts[1].isdigit():
+                target = str("-100" + parts[1])
+        else:
+            target = target.split("/")[0].split("?")[0]
+
     if target.startswith("@"):
         target = target[1:]
 
@@ -1234,7 +1264,7 @@ async def rem_fs_handler(client: Client, message: Message):
 
     if not channel_doc:
         for doc in db.force_channels.find({}):
-            if str(doc.get("chat_id")) == target or str(doc.get("_id")) == target or (doc.get("username") and doc.get("username").lower() == target.lower()):
+            if str(doc.get("chat_id")) == target or str(doc.get("_id")) == target or (doc.get("username") and doc.get("username").lower() == target.lower()) or (doc.get("invite_link") and target in doc.get("invite_link")):
                 channel_doc = doc
                 break
 
