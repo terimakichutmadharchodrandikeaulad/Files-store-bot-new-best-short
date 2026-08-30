@@ -698,7 +698,8 @@ async def file_handler(client: Client, message: Message):
         bot_username = (await client.get_me()).username
         share_link = f"https://t.me/{bot_username}?start={file_id_str}"
         
-        share_button = InlineKeyboardButton(to_small_caps("📤 Share Link"), url=f"https://t.me/share/url?url={urllib.parse.quote(f'File: {file_name}\nLink: {share_link}')}")
+        share_text = f"File: {file_name}\nLink: {share_link}"
+        share_button = InlineKeyboardButton(to_small_caps("📤 Share Link"), url=f"https://t.me/share/url?url={urllib.parse.quote(share_text)}")
         
         reply_text = to_small_caps(
             f"🎉 Link Generated Successfully! 🎉\n\n"
@@ -849,7 +850,8 @@ async def done_handler(client: Client, message: Message):
             
             db.settings.delete_one({"_id": user_id, "type": "temp_link"})
             
-            share_button = InlineKeyboardButton(to_small_caps("📤 Share Bundle Link"), url=f"https://t.me/share/url?url={urllib.parse.quote(f'Bundle: {file_name}\nLink: {share_link}')}")
+            share_text = f"Bundle: {file_name}\nLink: {share_link}"
+            share_button = InlineKeyboardButton(to_small_caps("📤 Share Bundle Link"), url=f"https://t.me/share/url?url={urllib.parse.quote(share_text)}")
             
             reply_text = to_small_caps(
                 f"🎉 Multi-File Bundle Link Generated! 🎉\n\n"
