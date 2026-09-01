@@ -296,10 +296,10 @@ load_dotenv(".env")
 
 # --- Configuration ---
 try:
-    API_ID = int(os.environ.get("API_ID"))
-    API_HASH = os.environ.get("API_HASH")
-    BOT_TOKEN = os.environ.get("BOT_TOKEN")
-    LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL"))
+    API_ID = int(os.environ.get("API_ID", "0"))
+    API_HASH = os.environ.get("API_HASH", "")
+    BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+    LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", "0"))
     GROUP_LOG_CHANNEL = int(os.environ.get("GROUP_LOG_CHANNEL", "0"))
     OWNER_ID = int(os.environ.get("OWNER_ID", "7524032836"))
     
@@ -313,7 +313,6 @@ try:
     
 except (ValueError, TypeError) as e:
     logging.error(f"❌ Environment variables configuration error: {e}")
-    exit()
 
 # --- Initialize Database ---
 db = JsonDatabase("database.json")
@@ -368,6 +367,42 @@ async def get_user_full_name(user):
             full_name += f" {user.last_name}"
         return full_name.strip() if full_name else f"User_{user.id}"
     return "Unknown User"
+
+def parse_channel_input(target_input):
+    """
+    Parses user input for channels (usernames, links, invite links, chat IDs).
+    Returns clean username, invite link string, or integer chat ID.
+    """
+    if isinstance(target_input, int):
+        return target_input
+
+    if not isinstance(target_input, str):
+        return target_input
+
+    target = target_input.strip()
+
+    if target.lstrip("-").isdigit():
+        return int(target)
+
+    if re.match(r'^(?:www\.)?(?:t(?:elegram)?\.(?:org|me|dog))/', target, re.IGNORECASE):
+        target = "https://" + target
+
+    if target.startswith("+"):
+        return f"https://t.me/{target}"
+    if target.startswith("joinchat/"):
+        return f"https://t.me/{target}"
+
+    if re.match(r'^https?://(?:www\.)?(?:t(?:elegram)?\.(?:org|me|dog))/(?:\+|\bjoinchat/)\S+', target, re.IGNORECASE):
+        return target
+
+    tme_match = re.match(r'^https?://(?:www\.)?(?:t(?:elegram)?\.(?:org|me|dog))/([a-zA-Z0-9_]{4,})(?:/\d+)?/?$', target, re.IGNORECASE)
+    if tme_match:
+        return tme_match.group(1)
+
+    if target.startswith("@"):
+        target = target[1:]
+
+    return target
 
 async def get_required_channels_data(client: Client, extra_channels: list = None) -> list:
     """
@@ -451,7 +486,8 @@ async def get_missing_channels_for_user(client: Client, user_id: int, channels_d
         # Check membership using Pyrogram
         try:
             member = await client.get_chat_member(target, user_id)
-            if member.status in ["owner", "administrator", "member", "restricted"]:
+            status_val = member.status.value if hasattr(member.status, "value") else str(member.status)
+            if status_val in ["owner", "administrator", "member", "restricted"]:
                 is_satisfied = True
         except UserNotParticipant:
             pass
@@ -660,9 +696,8 @@ async def help_handler_private(client: Client, message: Message):
 @app.on_message(filters.command("create_link") & filters.private)
 @force_join_check
 async def create_link_handler(client: Client, message: Message):
-    if len(message.command) == 1 or (len(message.command) > 1 and not message.command[1].startswith('@')):
-        file_name = " ".join(message.command[1:]) if len(message.command) > 1 else None
-        
+    if len(message.command) == 1:
+        file_name = None
         user_state = db.settings.find_one({"_id": message.from_user.id, "type": "temp_link"})
         thumbnail_id = user_state.get("thumbnail_id") if user_state else None
             
@@ -673,37 +708,64 @@ async def create_link_handler(client: Client, message: Message):
         )
         await message.reply(to_small_caps("Okay! Now send me a single file to generate a link."))
         return
-        
-    channel_index = 1
-    if not message.command[channel_index].startswith('@'):
-         return await create_link_handler(client, message)
-         
-    force_channel = message.command[channel_index].replace('@', '').strip()
-    file_name = " ".join(message.command[channel_index+1:]) if len(message.command) > channel_index+1 else None
-    
-    try:
-        chat = await client.get_chat(force_channel)
-        if chat.type != 'channel':
-            await message.reply(to_small_caps("❌ That is not a valid public channel username. Please provide a public channel username."))
-            return
-        
-        await client.get_chat_member(chat_id=f"@{force_channel}", user_id=(await client.get_me()).id)
-        
+
+    first_arg = message.command[1]
+    is_channel_arg = first_arg.startswith('@') or first_arg.startswith('http://') or first_arg.startswith('https://') or first_arg.startswith('t.me/') or first_arg.startswith('+') or first_arg.startswith('joinchat/')
+
+    if not is_channel_arg:
+        file_name = " ".join(message.command[1:])
         user_state = db.settings.find_one({"_id": message.from_user.id, "type": "temp_link"})
         thumbnail_id = user_state.get("thumbnail_id") if user_state else None
-        
         db.settings.update_one(
             {"_id": message.from_user.id, "type": "temp_link"},
-            {"$set": {"state": "single_link", "force_channel": force_channel, "file_name": file_name, "thumbnail_id": thumbnail_id}},
+            {"$set": {"state": "single_link", "force_channel": None, "file_name": file_name, "thumbnail_id": thumbnail_id}},
             upsert=True
         )
-        
-        await message.reply(to_small_caps(f"✅ Force join channel set to @{force_channel}. Now send me a file to get its link."))
-        
+        await message.reply(to_small_caps("Okay! Now send me a single file to generate a link."))
+        return
+
+    force_channel = parse_channel_input(first_arg)
+    file_name = " ".join(message.command[2:]) if len(message.command) > 2 else None
+
+    try:
+        try:
+            chat = await client.get_chat(force_channel)
+        except Exception as get_chat_err:
+            if isinstance(force_channel, str) and ("t.me/+" in force_channel or "joinchat" in force_channel):
+                chat = await client.join_chat(force_channel)
+            else:
+                raise get_chat_err
+
+        status_val = None
+        bot_me = await client.get_me()
+        try:
+            bot_member = await client.get_chat_member(chat_id=chat.id, user_id=bot_me.id)
+            status_val = bot_member.status.value if hasattr(bot_member.status, "value") else str(bot_member.status)
+        except Exception:
+            pass
+
+        if status_val not in ["administrator", "owner"]:
+            await message.reply(to_small_caps("❌ I am not an admin in that channel. Please check my permissions."))
+            return
+
+        user_state = db.settings.find_one({"_id": message.from_user.id, "type": "temp_link"})
+        thumbnail_id = user_state.get("thumbnail_id") if user_state else None
+
+        channel_store = chat.username or str(chat.id)
+        channel_ref = f"@{chat.username}" if chat.username else chat.title
+
+        db.settings.update_one(
+            {"_id": message.from_user.id, "type": "temp_link"},
+            {"$set": {"state": "single_link", "force_channel": channel_store, "file_name": file_name, "thumbnail_id": thumbnail_id}},
+            upsert=True
+        )
+
+        await message.reply(to_small_caps(f"✅ Force join channel set to {channel_ref}. Now send me a file to get its link."))
+
     except ChatAdminRequired:
          await message.reply(to_small_caps("❌ I'm not an admin in that channel. Please check my permissions."))
     except Exception as e:
-        await message.reply(to_small_caps(f"❌ I could not find that channel or I'm not a member there. Please make sure the channel is public and I have access.\nError: {e}"))
+        await message.reply(to_small_caps(f"❌ I could not find that channel or I'm not a member there. Please make sure the channel is accessible and I have access.\nError: {e}"))
 
 @app.on_message(filters.command("set_thumbnail") & filters.private)
 @force_join_check
@@ -863,36 +925,54 @@ async def multi_link_handler(client: Client, message: Message):
     file_name = None
 
     if command_parts:
-        if command_parts[0].startswith('@'):
-            force_channel = command_parts[0].replace('@', '').strip()
-            file_name = " ".join(command_parts[1:])
+        first_arg = command_parts[0]
+        if first_arg.startswith('@') or first_arg.startswith('http://') or first_arg.startswith('https://') or first_arg.startswith('t.me/') or first_arg.startswith('+') or first_arg.startswith('joinchat/'):
+            force_channel = parse_channel_input(first_arg)
+            file_name = " ".join(command_parts[1:]) if len(command_parts) > 1 else None
         else:
             file_name = " ".join(command_parts)
-    
+
     user_state = db.settings.find_one({"_id": message.from_user.id, "type": "temp_link"})
     thumbnail_id = user_state.get("thumbnail_id") if user_state else None
-    
+
     if force_channel:
         try:
-            chat = await client.get_chat(force_channel)
-            if chat.type != 'channel':
-                await message.reply(to_small_caps("❌ That is not a valid public channel username."))
+            try:
+                chat = await client.get_chat(force_channel)
+            except Exception as get_chat_err:
+                if isinstance(force_channel, str) and ("t.me/+" in force_channel or "joinchat" in force_channel):
+                    chat = await client.join_chat(force_channel)
+                else:
+                    raise get_chat_err
+
+            status_val = None
+            bot_me = await client.get_me()
+            try:
+                bot_member = await client.get_chat_member(chat_id=chat.id, user_id=bot_me.id)
+                status_val = bot_member.status.value if hasattr(bot_member.status, "value") else str(bot_member.status)
+            except Exception:
+                pass
+
+            if status_val not in ["administrator", "owner"]:
+                await message.reply(to_small_caps("❌ I am not an admin in that channel. Please check my permissions."))
                 return
-            await client.get_chat_member(chat_id=f"@{force_channel}", user_id=(await client.get_me()).id)
-            
+
+            channel_store = chat.username or str(chat.id)
+            channel_ref = f"@{chat.username}" if chat.username else chat.title
+
             db.settings.update_one(
                 {"_id": message.from_user.id, "type": "temp_link"},
-                {"$set": {"state": "multi_link", "message_ids": [], "force_channel": force_channel, "file_name": file_name, "thumbnail_id": thumbnail_id}},
+                {"$set": {"state": "multi_link", "message_ids": [], "force_channel": channel_store, "file_name": file_name, "thumbnail_id": thumbnail_id}},
                 upsert=True
             )
-            await message.reply(to_small_caps(f"✅ Force join channel set to @{force_channel}. Now, forward files for the bundle. Send /done to finish."))
+            await message.reply(to_small_caps(f"✅ Force join channel set to {channel_ref}. Now, forward files for the bundle. Send /done to finish."))
             return
-            
+
         except ChatAdminRequired:
             await message.reply(to_small_caps("❌ I'm not an admin in that channel. Please check my permissions."))
             return
         except Exception as e:
-            await message.reply(to_small_caps(f"❌ I could not find that channel or I'm not a member there. Please check the username.\nError: {e}"))
+            await message.reply(to_small_caps(f"❌ I could not find that channel or I'm not a member there. Please check the channel link or username.\nError: {e}"))
             return
 
     db.settings.update_one(
@@ -1154,26 +1234,25 @@ async def set_fs_handler(client: Client, message: Message):
         await message.reply(to_small_caps("❌ Invalid channel specified."))
         return
 
-    if isinstance(target_chat, str):
-        if target_chat.startswith("https://t.me/"):
-            target_chat = target_chat.replace("https://t.me/", "")
-            if not target_chat.startswith("+") and not target_chat.startswith("joinchat/") and "/" in target_chat:
-                target_chat = target_chat.split("/")[0]
-        if target_chat.startswith("@"):
-            target_chat = target_chat[1:]
-        if target_chat.lstrip("-").isdigit():
-            target_chat = int(target_chat)
+    parsed_target = parse_channel_input(target_chat)
 
     try:
-        chat = await client.get_chat(target_chat)
+        try:
+            chat = await client.get_chat(parsed_target)
+        except Exception as get_chat_err:
+            if isinstance(parsed_target, str) and ("t.me/+" in parsed_target or "joinchat" in parsed_target):
+                chat = await client.join_chat(parsed_target)
+            else:
+                raise get_chat_err
     except Exception as e:
-        await message.reply(to_small_caps(f"❌ Failed to get chat details: {e}\nMake sure the bot is an admin in the channel."))
+        await message.reply(to_small_caps(f"❌ Failed to get chat details: Telegram says: {e}\nMake sure the bot is an admin in the channel."))
         return
 
     bot_me = await client.get_me()
     try:
         bot_member = await client.get_chat_member(chat.id, bot_me.id)
-        if bot_member.status not in ["administrator", "owner"]:
+        status_val = bot_member.status.value if hasattr(bot_member.status, "value") else str(bot_member.status)
+        if status_val not in ["administrator", "owner"]:
             await message.reply(to_small_caps("❌ I am not an admin in that channel. Please promote me to admin first."))
             return
     except Exception as e:
@@ -1218,23 +1297,24 @@ async def set_fs_handler(client: Client, message: Message):
 @app.on_message(filters.command(["remfs", "del_fs", "delfs"]) & filters.private & filters.user(ADMINS))
 async def rem_fs_handler(client: Client, message: Message):
     if len(message.command) < 2:
-        await message.reply(to_small_caps("❌ Usage: /remfs <channel_id or @username>"))
+        await message.reply(to_small_caps("❌ Usage: /remfs <channel_id or @username or invite_link>"))
         return
 
-    target = message.command[1].strip()
-    if target.startswith("@"):
-        target = target[1:]
+    raw_target = message.command[1].strip()
+    parsed_target = parse_channel_input(raw_target)
+    target_str = str(parsed_target)
 
     channel_doc = None
-    if target.lstrip("-").isdigit():
-        channel_doc = db.force_channels.find_one({"_id": target}) or db.force_channels.find_one({"chat_id": int(target)})
+    if isinstance(parsed_target, int) or target_str.lstrip("-").isdigit():
+        chat_id_val = int(parsed_target) if isinstance(parsed_target, int) or target_str.lstrip("-").isdigit() else None
+        channel_doc = db.force_channels.find_one({"_id": target_str}) or (db.force_channels.find_one({"chat_id": chat_id_val}) if chat_id_val else None)
 
     if not channel_doc:
-        channel_doc = db.force_channels.find_one({"username": target})
+        channel_doc = db.force_channels.find_one({"username": target_str})
 
     if not channel_doc:
         for doc in db.force_channels.find({}):
-            if str(doc.get("chat_id")) == target or str(doc.get("_id")) == target or (doc.get("username") and doc.get("username").lower() == target.lower()):
+            if str(doc.get("chat_id")) == target_str or str(doc.get("_id")) == target_str or (doc.get("username") and doc.get("username").lower() == target_str.lower()) or (doc.get("invite_link") and doc.get("invite_link") == raw_target):
                 channel_doc = doc
                 break
 
